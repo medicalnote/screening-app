@@ -437,7 +437,8 @@ def auto_cut_junior(profile: dict, cfg: dict):
 # ─────────────────────────────────────────────
 # Claude API 判定
 # ─────────────────────────────────────────────
-def ai_judge(api_key: str, bu_id: str, profile: dict, system_prompt: str) -> dict:
+def ai_judge(api_key: str, bu_id: str, profile: dict, system_prompt: str,
+             _status_placeholder=None) -> dict:
     client = anthropic.Anthropic(api_key=api_key)
     candidate_info = f"""
 候補者ID: {bu_id}
@@ -456,27 +457,53 @@ def ai_judge(api_key: str, bu_id: str, profile: dict, system_prompt: str) -> dic
 【職務要約】
 {profile['job_summary']}
 """
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=system_prompt,
-        messages=[{"role": "user", "content": candidate_info}]
-    )
-    result_text = response.content[0].text
-    judge_m  = re.search(r"判定:\s*([AB][+\-]?|C)", result_text)
-    reason_m = re.search(r"理由:\s*(.+?)(?:スカウトポイント:|$)", result_text, re.DOTALL)
-    scout_m  = re.search(r"スカウトポイント:\s*(.+?)$", result_text, re.DOTALL)
-    judge  = judge_m.group(1).strip()  if judge_m  else "B-"
-    reason = reason_m.group(1).strip() if reason_m else result_text
-    scout  = scout_m.group(1).strip()  if scout_m  else ""
-    if judge not in ["A", "B+", "B-", "C"]:
-        judge = "B-"
-    return {"judge": judge, "reason": reason, "scout": scout, "raw": result_text}
+    # レート制限対策: 最大3回リトライ（待機時間: 65秒 → 130秒 → 195秒）
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                system=system_prompt,
+                messages=[{"role": "user", "content": candidate_info}]
+            )
+            result_text = response.content[0].text
+            judge_m  = re.search(r"判定:\s*([AB][+\-]?|C)", result_text)
+            reason_m = re.search(r"理由:\s*(.+?)(?:スカウトポイント:|$)", result_text, re.DOTALL)
+            scout_m  = re.search(r"スカウトポイント:\s*(.+?)$", result_text, re.DOTALL)
+            judge  = judge_m.group(1).strip()  if judge_m  else "B-"
+            reason = reason_m.group(1).strip() if reason_m else result_text
+            scout  = scout_m.group(1).strip()  if scout_m  else ""
+            if judge not in ["A", "B+", "B-", "C"]:
+                judge = "B-"
+            return {"judge": judge, "reason": reason, "scout": scout, "raw": result_text}
+
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = (
+                "rate_limit" in err_str.lower() or
+                "429" in err_str or
+                "too_many_requests" in err_str.lower() or
+                "overloaded" in err_str.lower()
+            )
+            if is_rate_limit and attempt < max_retries:
+                wait_sec = 65 * (attempt + 1)  # 65秒 → 130秒 → 195秒
+                for remaining in range(wait_sec, 0, -1):
+                    if _status_placeholder:
+                        _status_placeholder.warning(
+                            f"⏳ レート制限のため待機中… {remaining}秒後にリトライします "
+                            f"（{attempt+1}/{max_retries}回目）　`{bu_id}`"
+                        )
+                    time.sleep(1)
+            else:
+                # リトライ上限超過 or レート制限以外のエラー
+                return {"judge": "ERROR", "reason": f"APIエラー（{attempt+1}回試行）: {err_str[:120]}", "scout": "", "raw": ""}
 
 
-def ai_judge_junior(api_key: str, bu_id: str, profile: dict, system_prompt: str) -> dict:
+def ai_judge_junior(api_key: str, bu_id: str, profile: dict, system_prompt: str,
+                    _status_placeholder=None) -> dict:
     """若手専用: 通常の判定に加え推奨求人も取得する"""
-    result = ai_judge(api_key, bu_id, profile, system_prompt)
+    result = ai_judge(api_key, bu_id, profile, system_prompt, _status_placeholder=_status_placeholder)
     raw = result.get("raw", "")
     job_m    = re.search(r"推奨求人:\s*(.+?)(?:\n|$)", raw)
     reason_m = re.search(r"推奨理由:\s*(.+?)(?:\n|$)", raw)
@@ -839,24 +866,22 @@ def page_screening():
                 j, note = auto_cut_fn(profile, cfg)
                 if j == "C":
                     return {"judge": "C", "reason": note, "scout": ""}
-                try:
-                    res = ai_judge(api_key, bu_id, profile, prompt)
-                    time.sleep(0.2)
-                    return res
-                except Exception as e:
-                    return {"judge": "B-", "reason": f"APIエラー: {str(e)[:80]}", "scout": ""}
+                res = ai_judge(api_key, bu_id, profile, prompt, _status_placeholder=status_text)
+                time.sleep(0.5)
+                if res["judge"] == "ERROR":
+                    res["judge"] = "B-"
+                return res
 
             # 若手は推奨求人も判定する専用関数を使う
             def judge_junior():
                 j, note = auto_cut_junior(profile, cfg)
                 if j == "C":
                     return {"judge": "C", "reason": note, "scout": "", "scout_job": "—", "scout_reason": ""}
-                try:
-                    res = ai_judge_junior(api_key, bu_id, profile, prompt_junior)
-                    time.sleep(0.2)
-                    return res
-                except Exception as e:
-                    return {"judge": "B-", "reason": f"APIエラー: {str(e)[:80]}", "scout": "", "scout_job": "—", "scout_reason": ""}
+                res = ai_judge_junior(api_key, bu_id, profile, prompt_junior, _status_placeholder=status_text)
+                time.sleep(0.5)
+                if res["judge"] == "ERROR":
+                    res["judge"] = "B-"
+                return res
 
             results.append({
                 "bu_id":   bu_id,
